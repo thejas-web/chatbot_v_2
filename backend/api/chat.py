@@ -11,7 +11,7 @@ from backend.Retrieval.retrieve import RagRetriever
 from backend.Retrieval.generate import RagGenerator
 from backend.db.database import get_db
 from backend.db.models import ChatSession, ChatMessage, Lead
-
+from backend.config import TOP_K
 
 router = APIRouter()
 
@@ -43,8 +43,6 @@ class ChatRequest(BaseModel):
 
     # Frontend sends None on first message
     session_id: str | None = None
-
-    top_k: int = 10
 
     score_threshold: float = 0.0
 
@@ -219,7 +217,7 @@ async def chat(
 
     results = retriever.retrieve(
         query=request.query,
-        top_k=request.top_k,
+        top_k=TOP_K,
         score_threshold=request.score_threshold,
     )
 
