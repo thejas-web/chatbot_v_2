@@ -14,7 +14,7 @@ CHUNK_SIZE = 800
 
 CHUNK_OVERLAP = 100
 
-TOP_K = 5
+TOP_K = 10
 
 
 SITE_ROOT = "https://www.webenza.com"
