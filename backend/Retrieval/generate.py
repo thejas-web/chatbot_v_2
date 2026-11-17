@@ -84,7 +84,7 @@ class RagGenerator:
 
 #llama-3.3-70b-versatile
 
-    def __init__(self, model: str = "openai/gpt-oss-120b", api_key: str = None):
+    def __init__(self, model: str = "openai/gpt-oss-20b", api_key: str = None):
         # Pass api_key explicitly, or set GROQ_API_KEY as an env var
         self.client = Groq(api_key=groq_api_key)
         self.model = model
