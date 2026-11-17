@@ -33,3 +33,7 @@ cartesia_api_key = os.getenv("CARTESIA_API_KEY")
 
 SIMLI_API_KEY = os.getenv('SIMLI_API_KEY')
 SIMLI_FACE_ID = os.getenv('SIMLI_FACE_ID')
+
+
+ANAM_API_KEY = os.getenv("ANAM_API_KEY")
+ANAM_AVATAR_ID = os.getenv("ANAM_AVATAR_ID")

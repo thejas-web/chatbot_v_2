@@ -10,6 +10,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@anam-ai/js-sdk": "^4.29.2",
     "@ricky0123/vad-web": "^0.0.31",
     "onnxruntime-web": "^1.22.0",
     "react": "^19.2.8",

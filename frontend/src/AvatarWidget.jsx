@@ -1,13 +1,13 @@
 import { useRef, useState } from "react";
-import { SimliClient, LogLevel } from "simli-client";
+import { createClient } from "@anam-ai/js-sdk";
 const { MicVAD, utils } = window.vad;
 //const API_URL = "http://localhost:8000";
 const API_URL = "";
 
 function AvatarWidget() {
     const videoRef = useRef(null);
-    const audioRef = useRef(null);
-    const simliClientRef = useRef(null);
+    const anamClientRef = useRef(null);
+    const anamAudioStreamRef = useRef(null);
 
     // --------------------------------------------------
     // VOICE ACTIVITY DETECTION
@@ -15,6 +15,7 @@ function AvatarWidget() {
 
     const vadRef = useRef(null);
     const vadStartingRef = useRef(false);
+    const vadRunningRef = useRef(false);
     const conversationActiveRef = useRef(false);
     const processingSpeechRef = useRef(false);
     const avatarSpeakingRef = useRef(false);
@@ -24,21 +25,27 @@ function AvatarWidget() {
     // TTS AUDIO BUFFER / QUEUE
     // --------------------------------------------------
 
-    const PCM_FRAME_SIZE = 1280;
+    // Cartesia returns raw PCM signed 16-bit little-endian audio at 16 kHz.
+    // The Anam audio input stream is configured for the same format.
+    const AUDIO_SAMPLE_RATE = 16000;
+    const AUDIO_CHANNELS = 1;
+    const BYTES_PER_SAMPLE = 2;
+    const PCM_BYTES_PER_SECOND =
+        AUDIO_SAMPLE_RATE * AUDIO_CHANNELS * BYTES_PER_SAMPLE;
 
-    const INITIAL_BUFFER_SIZE = 6400;
+    // 1280 bytes = 40 ms of 16 kHz, mono, PCM16 audio.
+    const PCM_FRAME_SIZE = 1280;
+    const INITIAL_BUFFER_SIZE = 6400; // 200 ms
+    const PLAYBACK_COMPLETION_PADDING_MS = 500;
 
     const ttsQueueRef = useRef([]);
-
     const pcmBufferRef = useRef(new Uint8Array(0));
-
-    const ttsConsumerRunningRef = useRef(false);
-
     const ttsPlaybackStartedRef = useRef(false);
-
-    const ttsStreamFinishedRef = useRef(false);
-
+    const ttsPlaybackStartedAtRef = useRef(null);
     const ttsGenerationIdRef = useRef(0);
+
+    // Prevent microphone capture while the lead form is displayed.
+    const leadFormActiveRef = useRef(false);
 
     // --------------------------------------------------
     // STATE
@@ -128,6 +135,9 @@ function AvatarWidget() {
 
                     setIsListening(false);
 
+                    // Pause capture while this utterance is transcribed and answered.
+                    await stopVAD();
+
                     try {
                         const wavBuffer = utils.encodeWAV(audio);
 
@@ -160,6 +170,16 @@ function AvatarWidget() {
 
                     } finally {
                         processingSpeechRef.current = false;
+
+                        // Restart listening only after the complete chat/TTS
+                        // cycle has finished and no lead form is blocking input.
+                        if (
+                            conversationActiveRef.current &&
+                            !avatarSpeakingRef.current &&
+                            !leadFormActiveRef.current
+                        ) {
+                            await startVAD();
+                        }
                     }
                 },
 
@@ -198,57 +218,60 @@ function AvatarWidget() {
 
         if (
             !vadRef.current ||
-            !conversationActiveRef.current
+            !conversationActiveRef.current ||
+            processingSpeechRef.current ||
+            avatarSpeakingRef.current ||
+            leadFormActiveRef.current ||
+            vadRunningRef.current
         ) {
             return;
         }
 
         try {
             console.log("Starting VAD...");
-
             await vadRef.current.start();
+            vadRunningRef.current = true;
+
+            // If the session ended while start() was pending, stop immediately.
+            if (
+                !conversationActiveRef.current ||
+                leadFormActiveRef.current
+            ) {
+                await stopVAD();
+                return;
+            }
 
             console.log("VAD listening for speech.");
-
         } catch (err) {
-            console.error(
-                "Failed to start VAD:",
-                err
-            );
-
+            vadRunningRef.current = false;
+            console.error("Failed to start VAD:", err);
             setError(
-                err?.message ||
-                "Could not start microphone."
+                err?.message || "Could not start microphone."
             );
         }
     };
 
 
     const stopVAD = async () => {
-
-        if (!vadRef.current) {
+        if (!vadRef.current || !vadRunningRef.current) {
+            setIsListening(false);
             return;
         }
 
         try {
             console.log("Stopping VAD...");
-
             await vadRef.current.pause();
-
-            setIsListening(false);
-
         } catch (err) {
-
-            console.error(
-                "Failed to stop VAD:",
-                err
-            );
+            console.error("Failed to stop VAD:", err);
+        } finally {
+            vadRunningRef.current = false;
+            setIsListening(false);
         }
     };
 
 
     // --------------------------------------------------
-    // START SIMLI AVATAR
+    // START ANAM AVATAR
     // --------------------------------------------------
 
     const startAvatar = async () => {
@@ -260,139 +283,101 @@ function AvatarWidget() {
                 `${API_URL}/api/avatar-token`
             );
 
+            const data = await response.json().catch(() => ({}));
+
             if (!response.ok) {
+                console.error("Avatar token API error:", data);
+
                 throw new Error(
-                    `Failed to get avatar token: ${response.status}`
+                    typeof data.detail === "object"
+                        ? JSON.stringify(data.detail)
+                        : data.detail || `Failed to get Anam token: ${response.status}`
                 );
             }
 
-            const data = await response.json();
+            if (!data.session_token) {
+                throw new Error("The backend did not return an Anam session token.");
+            }
 
-            console.log("Simli token received");
+            console.log("Anam session token received");
 
-            const simliClient = new SimliClient(
+            const anamClient = createClient(
                 data.session_token,
-                videoRef.current,
-                audioRef.current,
-                null,
-                LogLevel.DEBUG,
-                "livekit"
+                {
+                    disableInputAudio: true,
+                }
             );
 
-            simliClientRef.current = simliClient;
+            anamClientRef.current = anamClient;
 
-            simliClient.on("start", async () => {
-                console.log("SIMLI STARTED");
-
-                setStatus("connected");
-
-                conversationActiveRef.current = true;
-
-                // Initialize VAD
-                await initializeVAD();
-
-                // Greet the user first
-                await speakAnswer(
-                    "Hello, and welcome to Webenza. I’m your AI assistant, here to help you learn more about our services, solutions, capabilities, and expertise. Feel free to ask me anything about Webenza or our offerings, and I’ll provide the information I have to help you. Whenever you’re ready, let’s get started."
-                );
-            });
-
-            simliClient.on("stop", async () => {
-                console.log("SIMLI STOPPED");
-
-                conversationActiveRef.current = false;
-                processingSpeechRef.current = false;
-
-                await stopVAD();
-
-                setIsListening(false);
-                setStatus("idle");
-            });
-
-            simliClient.on("error", async (message) => {
-                console.error(
-                    "SIMLI ERROR:",
-                    message
-                );
-
-                conversationActiveRef.current = false;
-                await stopVAD();
-
-                setStatus("error");
-
-                setError(
-                    typeof message === "string"
-                        ? message
-                        : "Simli connection failed"
-                );
-            });
-
-            simliClient.on("startup_error", async (message) => {
-                console.error(
-                    "SIMLI STARTUP ERROR:",
-                    message
-                );
-
-                conversationActiveRef.current = false;
-                await stopVAD();
-
-                setStatus("error");
-
-                setError(
-                    typeof message === "string"
-                        ? message
-                        : "Simli startup failed"
-                );
-            });
-
-            simliClient.on("speaking", async () => {
-                console.log("SIMLI SPEAKING");
-
-                avatarSpeakingRef.current = true;
-
-                // Safety: VAD must not listen while avatar is speaking.
-                await stopVAD();
-            });
-
-            simliClient.on("silent", async () => {
-                console.log("SIMLI SILENT");
-
-                // Ignore silent events that are not part of an active avatar playback.
-                if (!avatarPlaybackActiveRef.current) {
-                    return;
-                }
-
-                avatarPlaybackActiveRef.current = false;
-                avatarSpeakingRef.current = false;
-
-                if (
-                    conversationActiveRef.current &&
-                    !processingSpeechRef.current
-                ) {
-                    console.log("Simli finished speaking. Starting VAD...");
-                    await startVAD();
-                }
-            });
-
-            console.log("Starting Simli...");
-
-            await simliClient.start();
-
-            console.log(
-                "Simli start() completed"
+            await anamClient.streamToVideoElement(
+                "anam-avatar-video"
             );
+
+            // Initialize external TTS audio input
+            const audioStream =
+                anamClient.createAgentAudioInputStream({
+                    encoding: "pcm_s16le",
+                    sampleRate: 16000,
+                    channels: 1,
+                });
+
+            anamAudioStreamRef.current = audioStream;
+            console.log("Anam avatar connected");
+
+            conversationActiveRef.current = true;
+            vadRunningRef.current = false;
+            avatarSpeakingRef.current = false;
+            avatarPlaybackActiveRef.current = false;
+
+            setStatus("connected");
+
+            // ------------------------------------------
+            // INITIAL GREETING
+            // ------------------------------------------
+
+            console.log("Initializing conversation greeting...");
+
+            const greeting = 
+                "Hello, and welcome to Webenza. I'm your AI assistant, here to help you learn more about our services, solutions, capabilities, and expertise. Feel free to ask me anything about Webenza or our offerings, and I'll provide the information I have to help you. Whenever you're ready, let's get started.";
+
+            const greetingSpoken = await speakAnswer(greeting);
+
+            if (!conversationActiveRef.current) {
+                return;
+            }
+
+            if (!greetingSpoken) {
+                console.warn("Initial greeting could not be played.");
+            }
+
+            // Start microphone only after the greeting finishes.
+            await startVAD();
 
         } catch (err) {
-            console.error(
-                "Avatar error:",
-                err
-            );
+            console.error("Anam avatar error:", err);
+
+            conversationActiveRef.current = false;
+            avatarSpeakingRef.current = false;
+            avatarPlaybackActiveRef.current = false;
+
+            await stopVAD();
+
+            const client = anamClientRef.current;
+            anamClientRef.current = null;
+            anamAudioStreamRef.current = null;
+
+            if (client) {
+                try {
+                    await client.stopStreaming();
+                } catch (stopError) {
+                    console.warn("Could not clean up failed Anam session:", stopError);
+                }
+            }
 
             setStatus("error");
-
             setError(
-                err?.message ||
-                "Failed to connect to avatar"
+                err?.message || "Failed to connect to Anam avatar"
             );
         }
     };
@@ -402,73 +387,48 @@ function AvatarWidget() {
     // --------------------------------------------------
 
     const resetTTSBuffer = () => {
-        console.log(
-            "Resetting TTS audio buffer."
-        );
+        console.log("Resetting TTS audio buffer.");
 
         ttsQueueRef.current = [];
-
-        pcmBufferRef.current =
-            new Uint8Array(0);
-
-        ttsPlaybackStartedRef.current =
-            false;
-
-        ttsStreamFinishedRef.current =
-            false;
-
-        ttsConsumerRunningRef.current =
-            false;
+        pcmBufferRef.current = new Uint8Array(0);
+        ttsPlaybackStartedRef.current = false;
+        ttsPlaybackStartedAtRef.current = null;
     };
 
     // --------------------------------------------------
-    // STOP SIMLI AVATAR
+    // STOP ANAM AVATAR
     // --------------------------------------------------
 
     const stopAvatar = async () => {
-        try {
-            conversationActiveRef.current = false;
-            processingSpeechRef.current = false;
+        // Invalidate any TTS request that is still reading or waiting for playback.
+        ttsGenerationIdRef.current++;
 
+        conversationActiveRef.current = false;
+        avatarSpeakingRef.current = false;
+        avatarPlaybackActiveRef.current = false;
+        leadFormActiveRef.current = false;
 
-             // Stop considering the avatar as speaking.
-            avatarSpeakingRef.current = false;
-            avatarPlaybackActiveRef.current = false;
+        await stopVAD();
+        vadRunningRef.current = false;
 
+        const client = anamClientRef.current;
+        anamClientRef.current = null;
+        anamAudioStreamRef.current = null;
 
-            // Invalidate any TTS request that is still running.
-            ttsGenerationIdRef.current++;
-
-
-            // Stop microphone/VAD first.
-            await stopVAD();
-
-            // Destroy VAD so the microphone is released completely.
-            if (vadRef.current) {
-                try {
-                    await vadRef.current.destroy();
-                } catch (vadError) {
-                    console.warn("Could not destroy VAD:", vadError);
-                }
-
-                vadRef.current = null;
+        if (client) {
+            try {
+                await client.stopStreaming();
+            } catch (err) {
+                console.error("Error stopping Anam session:", err);
             }
-
-            if (simliClientRef.current) {
-                simliClientRef.current.stop();
-                simliClientRef.current = null;
-            }
-
-            resetTTSBuffer();
-
-            setIsListening(false);
-            setStatus("idle");
-            setTtsStatus("idle");
-            setChatStatus("idle");
-
-        } catch (err) {
-            console.error("Error stopping avatar:", err);
         }
+
+        resetTTSBuffer();
+
+        setIsListening(false);
+        setShowLeadForm(false);
+        setStatus("idle");
+        setTtsStatus("idle");
     };
 
     // --------------------------------------------------
@@ -550,99 +510,27 @@ function AvatarWidget() {
     // --------------------------------------------------
 
     const consumeTTSQueue = async () => {
-
-        if (ttsConsumerRunningRef.current) {
-            return;
+        if (!anamAudioStreamRef.current) {
+            throw new Error("Anam audio input stream is unavailable.");
         }
 
-        ttsConsumerRunningRef.current = true;
+        while (ttsQueueRef.current.length > 0) {
+            const audioFrame = ttsQueueRef.current.shift();
 
-        console.log(
-            `[TTS CONSUMER START] ${performance.now().toFixed(1)} ms | queue=${ttsQueueRef.current.length}`
-        );
-
-        try {
-
-            while (ttsQueueRef.current.length > 0) {
-
-                const audioFrame =
-                    ttsQueueRef.current.shift();
-
-                if (
-                    !audioFrame ||
-                    audioFrame.length === 0
-                ) {
-                    continue;
-                }
-
-                if (!simliClientRef.current) {
-
-                    console.warn(
-                        `[TTS SIMLI DISCONNECTED] ${performance.now().toFixed(1)} ms`
-                    );
-
-                    break;
-                }
-
-                // How much audio is still waiting BEFORE sending this frame?
-                const queuedBefore =
-                    ttsQueueRef.current.length *
-                    PCM_FRAME_SIZE /
-                    (16000 * 2);
-
-                console.log(
-                    `[TTS FRAME] ${performance.now().toFixed(1)} ms | ` +
-                    `sending=${audioFrame.length} bytes | ` +
-                    `queue=${ttsQueueRef.current.length} frames | ` +
-                    `buffer=${queuedBefore.toFixed(3)} sec`
-                );
-
-                simliClientRef.current.sendAudioData(
-                    audioFrame
-                );
-
-                await Promise.resolve();
+            if (!audioFrame || audioFrame.length === 0) {
+                continue;
             }
 
-        } catch (err) {
-
-            console.error(
-                "TTS queue consumer error:",
-                err
-            );
-
-            setError(
-                err?.message ||
-                "Failed to send audio to avatar."
-            );
-
-        } finally {
-
-            ttsConsumerRunningRef.current = false;
-
-            // IMPORTANT: tell us if the consumer actually drained
-            if (
-                ttsQueueRef.current.length === 0
-            ) {
-
-                console.log(
-                    `[TTS QUEUE EMPTY] ${performance.now().toFixed(1)} ms`
-                );
-
-            } else if (
-                simliClientRef.current
-            ) {
-
-                console.log(
-                    `[TTS CONSUMER RESTART] queue=${ttsQueueRef.current.length}`
-                );
-
-                consumeTTSQueue();
+            if (ttsPlaybackStartedAtRef.current === null) {
+                ttsPlaybackStartedAtRef.current = Date.now();
             }
 
-            console.log(
-                `[TTS CONSUMER STOPPED] ${performance.now().toFixed(1)} ms`
+            // Anam's agent audio input stream accepts Base64 PCM chunks.
+            const base64Audio = btoa(
+                String.fromCharCode(...audioFrame)
             );
+
+            await anamAudioStreamRef.current.sendAudioChunk(base64Audio);
         }
     };
 
@@ -651,143 +539,78 @@ function AvatarWidget() {
     // --------------------------------------------------
 
     const speakAnswer = async (text) => {
-
         if (!text || !text.trim()) {
             return false;
         }
 
-        const generationId =
-            ++ttsGenerationIdRef.current;
-        
+        const generationId = ++ttsGenerationIdRef.current;
+
         avatarSpeakingRef.current = true;
         avatarPlaybackActiveRef.current = true;
 
-        // Stop microphone/VAD while avatar speaks
+        // Stop microphone/VAD while the avatar is speaking.
         await stopVAD();
 
         try {
-            if (
-                !simliClientRef.current
-            ) {
-                throw new Error(
-                    "Avatar is not connected."
-                );
+            if (!anamAudioStreamRef.current) {
+                throw new Error("Anam avatar is not connected.");
             }
 
             setTtsStatus("generating");
             setError("");
 
             ttsQueueRef.current = [];
+            pcmBufferRef.current = new Uint8Array(0);
+            ttsPlaybackStartedRef.current = false;
+            ttsPlaybackStartedAtRef.current = null;
 
-            pcmBufferRef.current =
-                new Uint8Array(0);
+            console.log("Starting Cartesia TTS generation...");
+            console.log("TTS generation ID:", generationId);
 
-            ttsPlaybackStartedRef.current =
-                false;
-
-            ttsStreamFinishedRef.current =
-                false;
-
-            console.log(
-                "Starting TTS generation..."
-            );
-
-            console.log(
-                "TTS generation ID:",
-                generationId
-            );
-
-            const response = await fetch(
-                `${API_URL}/api/tts`,
-                {
-                    method: "POST",
-
-                    headers: {
-                        "Content-Type":
-                            "application/json",
-                    },
-
-                    body: JSON.stringify({
-                        text: text,
-                    }),
-                }
-            );
+            const response = await fetch(`${API_URL}/api/tts`, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify({ text }),
+            });
 
             if (!response.ok) {
-
-                const errorText =
-                    await response.text();
-
-                throw new Error(
-                    `TTS failed: ${errorText}`
-                );
+                const errorText = await response.text();
+                throw new Error(`TTS failed: ${errorText}`);
             }
 
             if (!response.body) {
-                throw new Error(
-                    "TTS response does not support streaming."
-                );
+                throw new Error("TTS response does not support streaming.");
             }
 
-            console.log(
-                "TTS stream connected."
-            );
-
-            const reader =
-                response.body.getReader();
-
+            const reader = response.body.getReader();
             let totalBytes = 0;
             let networkChunkNumber = 0;
 
             while (true) {
+                const { value, done } = await reader.read();
 
-                const {
-                    value,
-                    done
-                } = await reader.read();
-
-                if (
-                    generationId !==
-                    ttsGenerationIdRef.current
-                ) {
-
-                    console.log(
-                        "Old TTS request detected. Stopping."
-                    );
-
+                if (generationId !== ttsGenerationIdRef.current) {
+                    console.log("TTS request was cancelled because the session changed.");
                     try {
                         await reader.cancel();
                     } catch (cancelError) {
-                        console.warn(
-                            "Could not cancel TTS reader:",
-                            cancelError
-                        );
+                        console.warn("Could not cancel TTS reader:", cancelError);
                     }
-
-                    return;
+                    return false;
                 }
 
                 if (done) {
-
-                    console.log(
-                        "TTS stream finished."
-                    );
-
-                    ttsStreamFinishedRef.current =
-                        true;
-
+                    console.log("TTS HTTP stream finished.");
                     break;
                 }
 
-                if (
-                    !value ||
-                    value.length === 0
-                ) {
+                if (!value || value.length === 0) {
                     continue;
                 }
 
                 networkChunkNumber++;
-
                 totalBytes += value.length;
 
                 console.log(
@@ -797,180 +620,108 @@ function AvatarWidget() {
                 );
 
                 appendPCMData(value);
-
-                console.log(
-                    "Raw PCM buffer:",
-                    pcmBufferRef.current.length,
-                    "bytes"
-                );
-
                 createPCMFrames();
 
-                console.log(
-                    "Playable PCM frames:",
-                    ttsQueueRef.current.length
-                );
-
                 const bufferedBytes =
-                    ttsQueueRef.current.length *
-                    PCM_FRAME_SIZE;
+                    ttsQueueRef.current.length * PCM_FRAME_SIZE;
 
                 if (
                     !ttsPlaybackStartedRef.current &&
-                    bufferedBytes >=
-                        INITIAL_BUFFER_SIZE
+                    bufferedBytes >= INITIAL_BUFFER_SIZE
                 ) {
-
-                    console.log(
-                        "Initial TTS buffer reached."
-                    );
-
-                    console.log(
-                        "Buffered:",
-                        bufferedBytes,
-                        "bytes"
-                    );
-
-                    console.log(
-                        "Starting Simli audio playback."
-                    );
-
-                    ttsPlaybackStartedRef.current =
-                        true;
-
-
+                    ttsPlaybackStartedRef.current = true;
                     setTtsStatus("received");
-
-                    consumeTTSQueue();
-                }
-
-                else if (
-                    ttsPlaybackStartedRef.current
-                ) {
-
-                    consumeTTSQueue();
+                    await consumeTTSQueue();
+                } else if (ttsPlaybackStartedRef.current) {
+                    await consumeTTSQueue();
                 }
             }
 
-            if (
-                pcmBufferRef.current.length >
-                0
-            ) {
-
-                console.log(
-                    "Final partial PCM:",
-                    pcmBufferRef.current.length,
-                    "bytes"
-                );
-
-                const finalFrame =
-                    new Uint8Array(
-                        PCM_FRAME_SIZE
-                    );
-
-                finalFrame.set(
-                    pcmBufferRef.current
-                );
-
-                ttsQueueRef.current.push(
-                    finalFrame
-                );
-
-                pcmBufferRef.current =
-                    new Uint8Array(0);
+            // Send the final partial PCM frame without adding artificial silence.
+            if (pcmBufferRef.current.length > 0) {
+                ttsQueueRef.current.push(pcmBufferRef.current);
+                pcmBufferRef.current = new Uint8Array(0);
             }
 
-            if (
-                !ttsPlaybackStartedRef.current &&
-                ttsQueueRef.current.length >
-                0
-            ) {
+            if (totalBytes === 0) {
+                throw new Error("Cartesia returned an empty audio stream.");
+            }
 
-                console.log(
-                    "TTS response finished before initial buffer."
+            if (totalBytes % BYTES_PER_SAMPLE !== 0) {
+                throw new Error(
+                    "Cartesia returned an incomplete PCM16 sample (odd number of bytes)."
                 );
+            }
 
-                console.log(
-                    "Sending remaining audio."
-                );
-
-                ttsPlaybackStartedRef.current =
-                    true;
-
+            if (!ttsPlaybackStartedRef.current) {
+                ttsPlaybackStartedRef.current = true;
                 setTtsStatus("received");
-
-                await consumeTTSQueue();
             }
 
             await consumeTTSQueue();
 
-            console.log(
-                "Total PCM received:",
-                totalBytes,
-                "bytes"
+            if (!anamAudioStreamRef.current) {
+                throw new Error("Anam audio input stream was closed before TTS completed.");
+            }
+
+            // Signal that no more audio chunks belong to this speech sequence.
+            await anamAudioStreamRef.current.endSequence();
+
+            console.log("All TTS audio chunks sent to Anam.");
+
+            // The SDK's endSequence() closes the input sequence; it is not a
+            // playback-finished callback. Estimate the remaining playback time
+            // from the PCM duration and when the first frame was submitted.
+            const audioDurationMs =
+                (totalBytes / PCM_BYTES_PER_SECOND) * 1000;
+            const playbackStartedAt = ttsPlaybackStartedAtRef.current;
+            const elapsedSinceFirstSend = playbackStartedAt
+                ? Date.now() - playbackStartedAt
+                : 0;
+            const remainingPlaybackMs = Math.max(
+                0,
+                audioDurationMs - elapsedSinceFirstSend
             );
 
-            console.log(
-                "Network chunks received:",
-                networkChunkNumber
-            );
+            await new Promise((resolve) => {
+                setTimeout(
+                    resolve,
+                    remainingPlaybackMs + PLAYBACK_COMPLETION_PADDING_MS
+                );
+            });
 
-            console.log(
-                "Remaining queue:",
-                ttsQueueRef.current.length
-            );
+            // The user may have ended the session while playback was draining.
+            if (generationId !== ttsGenerationIdRef.current) {
+                return false;
+            }
 
-            console.log(
-                "TTS audio completely sent to Simli."
-            );
-
+            avatarSpeakingRef.current = false;
+            avatarPlaybackActiveRef.current = false;
             setTtsStatus("received");
 
-
-
+            console.log("Estimated Anam playback completion.");
             return true;
 
         } catch (err) {
+            console.error("Avatar TTS error:", err);
 
-            console.error(
-                "Avatar TTS error:",
-                err
-            );
-
-            if (
-                generationId ===
-                ttsGenerationIdRef.current
-            ) {
-
+            if (generationId === ttsGenerationIdRef.current) {
                 ttsQueueRef.current = [];
+                pcmBufferRef.current = new Uint8Array(0);
+                ttsPlaybackStartedRef.current = false;
+                ttsPlaybackStartedAtRef.current = null;
 
-                pcmBufferRef.current =
-                    new Uint8Array(0);
-
-                ttsPlaybackStartedRef.current =
-                    false;
+                avatarSpeakingRef.current = false;
+                avatarPlaybackActiveRef.current = false;
 
                 setTtsStatus("error");
-
                 setError(
-                    err?.message ||
-                    "Failed to make the avatar speak."
+                    err?.message || "Failed to make the avatar speak."
                 );
             }
 
-            // --------------------------------------------------
-            // RESET AVATAR STATE AFTER TTS ERROR
-            // --------------------------------------------------
-
-            avatarSpeakingRef.current = false;
-           
-
-            // If the conversation is still active, allow the user
-            // to speak again even after a TTS error.
-            if (conversationActiveRef.current) {
-                await startVAD();
-            }
-
+            // VAD is restarted in onSpeechEnd's finally block, after the
+            // entire request/TTS flow has returned and processingSpeech is reset.
             return false;
         }
     };
@@ -1114,10 +865,11 @@ function AvatarWidget() {
             ) {
 
                 console.log(
-                    "Avatar finished speaking. Showing lead form."
+                    "Avatar playback wait completed. Showing lead form."
                 );
 
                 setLeadError("");
+                leadFormActiveRef.current = true;
                 setShowLeadForm(true);
             }
 
@@ -1281,9 +1033,17 @@ function AvatarWidget() {
             });
 
             // Close after a short delay
-            setTimeout(() => {
+            setTimeout(async () => {
                 setShowLeadForm(false);
                 setLeadSubmitted(false);
+                leadFormActiveRef.current = false;
+
+                if (
+                    conversationActiveRef.current &&
+                    !avatarSpeakingRef.current
+                ) {
+                    await startVAD();
+                }
             }, 2000);
 
         } catch (err) {
@@ -1477,13 +1237,14 @@ function AvatarWidget() {
                     }
                 >
 
-                    <video
-                        ref={videoRef}
-                        autoPlay
-                        playsInline
-                        muted={false}
-                        style={styles.video}
-                    />
+                <video
+                    id="anam-avatar-video"
+                    ref={videoRef}
+                    autoPlay
+                    playsInline
+                    muted={false}
+                    style={styles.video}
+                />
 
                     {status !==
                         "connected" && (
@@ -1519,12 +1280,8 @@ function AvatarWidget() {
 
                 </div>
 
-                {/* SIMLI AUDIO */}
+                {/* ANAM AUDIO INPUT */}
 
-                <audio
-                    ref={audioRef}
-                    autoPlay
-                />
 
                 {/* DESCRIPTION */}
 
